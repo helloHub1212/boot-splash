@@ -1,0 +1,1193 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  boot-splash —— 在「图形开机动画」与「内核日志文本启动」之间切换
+#  Toggle between a graphical boot splash and plain kernel-log boot output.
+#
+#  目标观感：原版 Arch / Debian —— 内核 printk 日志 + systemd 的 [ OK ] 行
+#
+#  用法 / Usage:
+#    boot-splash off [-y] [--dry-run]   关闭开机动画 / turn the splash off
+#    boot-splash on  [-y] [--dry-run]   恢复开机动画 / restore the splash
+#    boot-splash status [--porcelain]   查看状态 / show state
+#    boot-splash rollback              回滚备份 / roll back
+#
+#  语言 / Language:
+#    BOOT_SPLASH_LANG=zh|en   默认按系统 locale 自动判断。
+#
+#  设计要点 / Design notes:
+#   1. 幂等 —— 目标值每次都从当前值重新推导，不做追加。
+#   2. 状态化 —— 被剥离的参数会记录在 state 里，恢复时按记录加回。
+#   3. 可重定向 —— BOOT_SPLASH_ROOT 把全部路径重定向到影子根。
+#   4. 可回滚 —— 每次写入前备份，rollback 一条命令还原。
+#
+#  需要 bash 4.0+（关联数组 / associative arrays）。
+# =============================================================================
+
+set -euo pipefail
+
+VERSION="V1.0"
+PROG="${0##*/}"
+
+# ---------- 可调配置 ---------------------------------------------------------
+# 关闭动画后追加到内核命令行的参数
+DEFAULT_CONSOLE_PARAMS="${BOOT_SPLASH_CONSOLE_PARAMS:-console=tty0 loglevel=7 fbcon=nodefer logo.nologo vt.global_cursor_default=0 plymouth.enable=0}"
+# 这些参数既压内核日志也压 systemd 状态行，开动画时加回
+DEFAULT_SPLASH_PARAMS="${BOOT_SPLASH_SPLASH_PARAMS:-quiet splash}"
+# 只参与「剥离」、但不会作为默认恢复值的参数（Fedora/RHEL 的 rhgb）
+DEFAULT_STRIP_EXTRA="${BOOT_SPLASH_STRIP_EXTRA:-rhgb}"
+# 前缀形式的图形启动标志（openSUSE 的 splash=silent / splash=verbose）
+DEFAULT_STRIP_PREFIXES="${BOOT_SPLASH_STRIP_PREFIXES:-splash=}"
+
+BACKUP_KEEP=5
+
+# ---------- 路径（全部经过影子根前缀）---------------------------------------
+R="${BOOT_SPLASH_ROOT:-}"
+STATE_DIR="${R}/var/lib/boot-splash"
+BACKUP_DIR="${STATE_DIR}/backups"
+STATE_FILE="${STATE_DIR}/state"
+
+# 运行时全局
+BACKEND=""        # kernel | limine | grub | bls
+CMDLINE_KIND=""   # plain  | limine | grub
+CMDLINE_FILE=""   # 实际读写的文件
+DRY_RUN=no
+ASSUME_YES=no
+NO_REGEN=no
+FORCE=no
+PORCELAIN=no
+CONSOLE_PARAMS="$DEFAULT_CONSOLE_PARAMS"
+SPLASH_PARAMS="$DEFAULT_SPLASH_PARAMS"
+STRIP_PARAMS=""
+STRIP_PREFIXES=""
+BLS_MODE="${BOOT_SPLASH_BLS:-auto}"   # auto | off
+
+PEND_FILES=()
+PEND_TMPS=()
+
+# ---------- 输出 -------------------------------------------------------------
+if [ -t 1 ]; then
+  C_RED=$'\033[1;31m'; C_GRN=$'\033[1;32m'; C_YEL=$'\033[1;33m'
+  C_BLU=$'\033[1;34m'; C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
+else
+  C_RED=""; C_GRN=""; C_YEL=""; C_BLU=""; C_DIM=""; C_OFF=""
+fi
+
+# =============================================================================
+#  国际化 / Internationalization
+# =============================================================================
+
+LANG_CODE="${BOOT_SPLASH_LANG:-}"
+case "$LANG_CODE" in
+  zh|en) ;;
+  *) case "${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}" in
+       zh*|*_CN*|*_TW*|*_HK*) LANG_CODE=zh ;;
+       *)                     LANG_CODE=en ;;
+     esac ;;
+esac
+
+declare -A MSG_ZH=(
+  [err.needroot]="需要 root 权限，请用 sudo 运行（或先加 --dry-run 预览）。"
+  [err.unknownarg]="未知参数：%s"
+  [err.locked]="另一个 boot-splash 实例正在运行。"
+
+  [limine.plus.detected]="检测到 KERNEL_CMDLINE[default]+= 形式的配置："
+  [limine.plus.note1]="+= 会忽略 /etc/kernel/cmdline，因此直接改写 /etc/default/limine 里的 KERNEL_CMDLINE[default]。"
+  [limine.plus.note2]="原有 /etc/default/limine 会覆盖所有 drop-in，那些 drop-in 的 += 内容将被忽略。"
+
+  [root.force]="新命令行里没有 root= 参数（--force 已忽略该检查）"
+  [root.lost]="拒绝写入：原命令行含 root=，新命令行不含 —— 会开出无法启动的系统。确认无误请加 --force。"
+  [root.missing]="拒绝写入：新命令行里没有 root= 参数。确认无误请加 --force。"
+
+  [plan.header]="计划修改 %s 个文件："
+  [confirm.noninteractive]="非交互环境，请显式加 -y 确认。"
+  [confirm.prompt]="继续？"
+  [apply.written]="已写入 %s"
+
+  [regen.skip]="已指定 --no-regen，跳过重新生成 initramfs / 引导配置。"
+  [regen.shadow]="影子根模式：跳过真实命令执行"
+  [regen.initramfs]="重新生成 initramfs ..."
+  [regen.no-generator]="未识别到 initramfs 生成器，请手工重新生成。"
+  [regen.bootloader]="刷新引导器配置 ..."
+  [regen.no-limine]="未找到 limine-update，请手工刷新 /boot/limine.conf。"
+  [regen.no-grub]="未找到 grub-mkconfig，请手工刷新 grub.cfg。"
+  [regen.bls]="BLS 后端：条目文件已直接更新，无需刷新引导器配置"
+
+  [verify.header]="校验 ..."
+  [verify.plymouth-present]="initramfs 里仍能找到 plymouth —— 确认 HOOKS 已保存并重新生成。"
+  [verify.plymouth-absent]="initramfs 中已无 plymouth"
+  [verify.limine-ok]="/boot/limine.conf 已带上 loglevel=7"
+  [verify.limine-missing]="/boot/limine.conf 里没找到新参数，检查 limine-update 是否成功。"
+  [verify.bls-missing]="BLS 条目里没找到新参数：%s"
+  [verify.enroll]="你启用了 ENABLE_ENROLL_LIMINE_CONFIG：必须再执行 limine-enroll-config，否则无法启动！"
+
+  [act.backend]="后端：%s    命令行文件：%s"
+  [act.nocmdline]="无法确定当前内核命令行。"
+  [act.already-console]="已经是「内核日志」模式，无需改动。"
+  [act.already-splash]="已经是「开机动画」模式，无需改动。"
+  [act.dryrun]="--dry-run：未做任何修改。"
+  [act.cancelled]="已取消。"
+  [act.done-console]="完成：开机将显示内核日志 + systemd [ OK ] 行。重启生效。"
+  [act.done-splash]="完成：已恢复图形开机动画。重启生效。"
+  [act.no-plymouth1]="系统里没有 plymouth 可执行文件，开机不会再有主题动画（只有引导器画面）。"
+  [act.no-plymouth2]="如需真正的图形动画，请先安装 plymouth 并确认对应主题。"
+
+  [st.title]="状态"
+  [st.mode]="模式"
+  [st.backend]="后端"
+  [st.cmdlinefile]="命令行文件"
+  [st.cmdline]="当前命令行"
+  [st.managed]="已管理参数"
+  [st.restore]="待恢复参数"
+  [st.missing]="(不存在)"
+  [st.none]="<无记录，on 时用默认 quiet splash>"
+  [st.hook]="mkinitcpio hook"
+  [st.hook.has]="含 plymouth"
+  [st.hook.none]="无 plymouth"
+  [st.runtime]="运行时"
+  [st.plymouth-installed]="plymouth 已安装"
+  [st.plymouth-running]="plymouthd 运行中"
+  [st.yes]="是"
+  [st.no]="否"
+  [st.vtconsole]="vtconsole"
+  [st.realcmdline]="本次实际命令行"
+  [st.menu]="引导器菜单"
+  [st.wallpaper]="检测到 limine wallpaper，可在 /boot/limine.conf 里删掉 wallpaper/wallpaper_style 行"
+
+  [rb.nobackup]="没有可用备份（%s）。"
+  [rb.latest]="最新备份：%s"
+  [rb.restore]="还原 /%s"
+  [rb.deleted]="删除本工具新建的 /%s"
+  [rb.done]="回滚完成，请重启生效。"
+)
+
+declare -A MSG_EN=(
+  [err.needroot]="Root privileges required. Run with sudo (or add --dry-run to preview first)."
+  [err.unknownarg]="Unknown argument: %s"
+  [err.locked]="Another boot-splash instance is already running."
+
+  [limine.plus.detected]="Found KERNEL_CMDLINE[default]+= style configuration:"
+  [limine.plus.note1]="+= ignores /etc/kernel/cmdline, so KERNEL_CMDLINE[default] in /etc/default/limine is rewritten directly."
+  [limine.plus.note2]="An existing /etc/default/limine overrides every drop-in, so their += content is ignored."
+
+  [root.force]="The new command line has no root= parameter (--force skipped this check)"
+  [root.lost]="Refusing to write: the source command line has root= but the new one does not — this would produce an unbootable system. Add --force if you are certain."
+  [root.missing]="Refusing to write: the new command line has no root= parameter. Add --force if you are certain."
+
+  [plan.header]="Planning to modify %s file(s):"
+  [confirm.noninteractive]="Non-interactive environment: pass -y to confirm explicitly."
+  [confirm.prompt]="Continue?"
+  [apply.written]="Written %s"
+
+  [regen.skip]="--no-regen given; skipping initramfs / bootloader regeneration."
+  [regen.shadow]="Shadow-root mode: skipping real command execution"
+  [regen.initramfs]="Regenerating initramfs ..."
+  [regen.no-generator]="No known initramfs generator found; please regenerate manually."
+  [regen.bootloader]="Refreshing bootloader configuration ..."
+  [regen.no-limine]="limine-update not found; please refresh /boot/limine.conf manually."
+  [regen.no-grub]="grub-mkconfig not found; please refresh grub.cfg manually."
+  [regen.bls]="BLS backend: entry files were updated directly; no bootloader refresh needed"
+
+  [verify.header]="Verifying ..."
+  [verify.plymouth-present]="plymouth is still present in the initramfs — make sure HOOKS was saved and the initramfs regenerated."
+  [verify.plymouth-absent]="No plymouth left in the initramfs"
+  [verify.limine-ok]="/boot/limine.conf now carries loglevel=7"
+  [verify.limine-missing]="New parameters not found in /boot/limine.conf; check whether limine-update succeeded."
+  [verify.bls-missing]="New parameters not found in the BLS entry: %s"
+  [verify.enroll]="You have ENABLE_ENROLL_LIMINE_CONFIG enabled: you must run limine-enroll-config, or the system will not boot!"
+
+  [act.backend]="Backend: %s    Command line file: %s"
+  [act.nocmdline]="Cannot determine the current kernel command line."
+  [act.already-console]="Already in kernel-log mode; nothing to do."
+  [act.already-splash]="Already in boot-splash mode; nothing to do."
+  [act.dryrun]="--dry-run: nothing was modified."
+  [act.cancelled]="Cancelled."
+  [act.done-console]="Done: the boot will show the kernel log + systemd [ OK ] lines. Takes effect after a reboot."
+  [act.done-splash]="Done: the graphical boot splash has been restored. Takes effect after a reboot."
+  [act.no-plymouth1]="There is no plymouth executable on this system, so there will be no theme animation at boot (only the bootloader screen)."
+  [act.no-plymouth2]="For a real graphical animation, install plymouth and make sure a matching theme is available."
+
+  [st.title]="State"
+  [st.mode]="Mode"
+  [st.backend]="Backend"
+  [st.cmdlinefile]="Command line file"
+  [st.cmdline]="Current command line"
+  [st.managed]="Managed parameters"
+  [st.restore]="Parameters to restore"
+  [st.missing]="(missing)"
+  [st.none]="<none recorded; 'on' uses the default quiet splash>"
+  [st.hook]="mkinitcpio hook"
+  [st.hook.has]="has plymouth"
+  [st.hook.none]="no plymouth"
+  [st.runtime]="Runtime"
+  [st.plymouth-installed]="plymouth installed"
+  [st.plymouth-running]="plymouthd running"
+  [st.yes]="yes"
+  [st.no]="no"
+  [st.vtconsole]="vtconsole"
+  [st.realcmdline]="Actual command line this boot"
+  [st.menu]="Bootloader menu"
+  [st.wallpaper]="limine wallpaper detected; you can delete the wallpaper/wallpaper_style lines in /boot/limine.conf"
+
+  [rb.nobackup]="No usable backup (%s)."
+  [rb.latest]="Most recent backup: %s"
+  [rb.restore]="Restoring /%s"
+  [rb.deleted]="Removing /%s (created by this tool)"
+  [rb.done]="Rollback complete; reboot for it to take effect."
+)
+
+# t <key> [printf 参数...]
+t() {
+  local key="$1"; shift
+  local s
+  if [ "$LANG_CODE" = zh ]; then s="${MSG_ZH[$key]-}"; else s="${MSG_EN[$key]-}"; fi
+  [ -n "$s" ] || s="[$key]"
+  if [ "$#" -eq 0 ]; then printf '%s' "$s"; else printf "$s" "$@"; fi
+  return 0
+}
+
+# ---------- 输出函数 ---------------------------------------------------------
+log()  { printf '%s==>%s %s\n' "$C_BLU" "$C_OFF" "$*"; }
+ok()   { printf '%s ok %s %s\n' "$C_GRN" "$C_OFF" "$*"; }
+warn() { printf '%s[!]%s %s\n' "$C_YEL" "$C_OFF" "$*" >&2; }
+err()  { printf '%s[x]%s %s\n' "$C_RED" "$C_OFF" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+dim()  { printf '%s    %s%s\n' "$C_DIM" "$*" "$C_OFF"; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# 按显示宽度右侧补空格（用于 status 的标签对齐，中英都能对整齐）
+padw() {
+  local s="$1" target="$2" cur
+  cur="$(printf '%s' "$s" | wc -L)"
+  case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
+  printf '%s' "$s"
+  while [ "$cur" -lt "$target" ]; do printf ' '; cur=$((cur + 1)); done
+}
+kv() { printf '    %s : %s\n' "$(padw "$1" 18)" "$2"; }
+
+# ---------- 小工具 -----------------------------------------------------------
+
+filter_out() { # $1=源串 之后=黑名单 token
+  local src="$1"; shift
+  local -a out=()
+  local w b skip
+  for w in $src; do
+    skip=no
+    for b in "$@"; do
+      [ "$w" = "$b" ] && { skip=yes; break; }
+    done
+    [ "$skip" = no ] && out+=("$w")
+  done
+  printf '%s' "${out[*]-}"
+}
+
+ensure_tokens() { # $1=源串 之后=必须存在的 token
+  local s="$1"; shift
+  local t
+  for t in "$@"; do
+    case " $s " in
+      *" $t "*) ;;
+      *) s="$s $t" ;;
+    esac
+  done
+  normalize "$s"
+}
+
+tokens_present_in() { # 返回 $1 中存在于 $2（空格列表）里的 token
+  local src="$1" pool="$2"
+  local -a out=()
+  local w
+  for w in $src; do
+    case " $pool " in
+      *" $w "*) out+=("$w") ;;
+    esac
+  done
+  printf '%s' "${out[*]-}"
+}
+
+filter_out_prefixes() { # $1=源串 $2=前缀列表
+  local src="$1" pres="$2"
+  local -a out=()
+  local w p skip
+  [ -n "$pres" ] || { printf '%s' "$src"; return 0; }
+  for w in $src; do
+    skip=no
+    for p in $pres; do
+      case "$w" in "$p"*) skip=yes; break ;; esac
+    done
+    [ "$skip" = no ] && out+=("$w")
+  done
+  printf '%s' "${out[*]-}"
+}
+
+tokens_matching_prefixes() { # $1=源串 $2=前缀列表
+  local src="$1" pres="$2"
+  local -a out=()
+  local w p
+  [ -n "$pres" ] || return 0
+  for w in $src; do
+    for p in $pres; do
+      case "$w" in "$p"*) out+=("$w"); break ;; esac
+    done
+  done
+  printf '%s' "${out[*]-}"
+}
+
+normalize() { printf '%s' "$1" | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//'; }
+
+strip_wrapping_quotes() {
+  local s
+  s="$(cat)"
+  case "$s" in
+    \"*\") s="${s#\"}"; s="${s%\"}" ;;
+  esac
+  printf '%s' "$s"
+}
+
+proc_cmdline_file() {
+  if [ -n "$R" ] && [ -f "${R}/proc/cmdline" ]; then
+    printf '%s' "${R}/proc/cmdline"
+  else
+    printf '%s' /proc/cmdline
+  fi
+}
+
+require_root() {
+  [ -n "$R" ] && return 0            # 影子根模式：测试用，不需要 root
+  [ "$DRY_RUN" = yes ] && return 0   # 只读预览，不需要 root
+  [ "$(id -u)" -eq 0 ] || die "$(t err.needroot)"
+}
+
+# ---------- 状态文件 ---------------------------------------------------------
+
+load_state() {
+  MODE=unknown
+  HOOK_REMOVED=no
+  PARAMS_REMOVED=""
+  PARAMS_ADDED=""
+  if [ -f "$STATE_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$STATE_FILE"
+  fi
+}
+
+save_state() {
+  mkdir -p "$STATE_DIR"
+  {
+    printf '# boot-splash state (generated by boot-splash %s); safe to edit by hand\n' "$VERSION"
+    printf 'MODE=%s\n' "$MODE"
+    printf 'BACKEND=%s\n' "$BACKEND"
+    printf 'CMDLINE_FILE=%s\n' "$CMDLINE_FILE"
+    printf 'HOOK_REMOVED=%s\n' "$HOOK_REMOVED"
+    printf 'PARAMS_REMOVED="%s"\n' "$PARAMS_REMOVED"
+    printf 'PARAMS_ADDED="%s"\n' "$PARAMS_ADDED"
+    printf 'UPDATED=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } > "$STATE_FILE"
+}
+
+# ---------- 备份 / 回滚 ------------------------------------------------------
+
+backup_file() {
+  local f="$1"
+  local ts="${TS:?apply_plan 必须先设置 TS}"
+  local rel="${f#"$R"}"
+  local dst="${BACKUP_DIR}/${ts}${rel}"
+  mkdir -p "$(dirname "$dst")"
+  if [ -e "$f" ]; then
+    cp -a "$f" "$dst"
+  else
+    mkdir -p "${BACKUP_DIR}/${ts}"
+    printf '%s\n' "$rel" >> "${BACKUP_DIR}/${ts}/NEW_FILES"
+  fi
+}
+
+prune_backups() {
+  local d
+  [ -d "$BACKUP_DIR" ] || return 0
+  ls -1 "$BACKUP_DIR" 2>/dev/null | sort -r | tail -n +$((BACKUP_KEEP + 1)) | while read -r d; do
+    [ -n "$d" ] && rm -rf "${BACKUP_DIR:?}/${d}"
+  done
+}
+
+# ---------- 后端探测：Limine -------------------------------------------------
+
+limine_conf_files() {
+  local f
+  [ -f "${R}/etc/default/limine" ] && printf '%s\n' "${R}/etc/default/limine"
+  for f in "${R}/etc/limine-entry-tool.d"/*.conf; do
+    [ -f "$f" ] && printf '%s\n' "$f"
+  done
+}
+
+# 注意：`[[:space:]]*=` 天然排除 `+=` 形式（`+` 不匹配），两个匹配互斥
+limine_has_key() { # $1=file  $2=default|fallback  —— 只匹配整体覆盖的 `=` 形式
+  local f="$1" key="$2"
+  [ -f "$f" ] || return 1
+  grep -qE "^[[:space:]]*KERNEL_CMDLINE\[${key}\][[:space:]]*=" "$f"
+}
+
+limine_eq_file() {
+  local f
+  while read -r f; do
+    [ -n "$f" ] || continue
+    if limine_has_key "$f" default; then
+      printf '%s' "$f"; return 0
+    fi
+  done < <(limine_conf_files)
+  return 1
+}
+
+limine_plus_files() {
+  local f
+  while read -r f; do
+    [ -n "$f" ] || continue
+    grep -qE "^[[:space:]]*KERNEL_CMDLINE\[default\][[:space:]]*\+=" "$f" && printf '%s\n' "$f"
+  done < <(limine_conf_files)
+  return 0
+}
+
+have_limine() {
+  if [ -n "$R" ]; then
+    # 影子根模式：只看影子根里的证据，否则会被宿主机已安装的 limine 干扰
+    [ -f "${R}/etc/limine-entry-tool.conf" ] || [ -f "${R}/boot/limine.conf" ] \
+      || [ -f "${R}/etc/default/limine" ] || [ -d "${R}/etc/limine-entry-tool.d" ]
+    return
+  fi
+  have limine-update || have limine-entry-tool || have limine-mkinitcpio \
+    || [ -f /etc/limine-entry-tool.conf ] || [ -f /boot/limine.conf ]
+}
+
+# ---------- 后端探测：BLS 条目 -----------------------------------------------
+# Fedora / RHEL / systemd-boot + kernel-install 把每条内核的启动参数存在
+# /boot/loader/entries/*.conf 的 options 行里；这些系统上的 grub.cfg 只是链过去。
+
+bls_entries() {
+  local f
+  for f in "${R}"/boot/loader/entries/*.conf; do
+    [ -f "$f" ] || continue
+    grep -qE '^[[:space:]]*options[[:space:]].*root=' "$f" || continue
+    printf '%s\n' "$f"
+  done
+  return 0
+}
+
+bls_has_entries() { [ -n "$(bls_entries | head -n1)" ]; }
+
+bls_read_options() { # $1=条目文件
+  sed -nE 's/^[[:space:]]*options[[:space:]]+//p' "$1" | head -n1
+}
+
+stage_bls_entries() { # $1=目标 cmdline
+  local target="$1" f tmp
+  [ "$BLS_MODE" = off ] && return 0
+  while read -r f; do
+    [ -n "$f" ] || continue
+    tmp="$(mktemp)"
+    awk -v v="$target" '
+      !done && /^[[:space:]]*options[[:space:]]/ {
+        match($0, /^[[:space:]]*options[[:space:]]+/)
+        print substr($0, 1, RLENGTH) v
+        done = 1; next
+      }
+      { print }
+    ' "$f" > "$tmp"
+    if diff -q "$f" "$tmp" >/dev/null 2>&1; then rm -f "$tmp"; continue; fi
+    stage "$f" "$tmp"
+  done < <(bls_entries)
+  return 0
+}
+
+resolve_backend() {
+  local eqf plusf
+  if have_limine; then
+    BACKEND=limine; CMDLINE_KIND=limine
+    eqf="$(limine_eq_file || true)"
+    if [ -n "$eqf" ]; then
+      CMDLINE_FILE="$eqf"
+      return 0
+    fi
+    plusf="$(limine_plus_files | head -n1 || true)"
+    if [ -n "$plusf" ]; then
+      CMDLINE_FILE="${R}/etc/default/limine"
+      warn "$(t limine.plus.detected)"
+      limine_plus_files | while read -r f; do printf '      %s\n' "$f" >&2; done
+      warn "$(t limine.plus.note1)"
+      warn "$(t limine.plus.note2)"
+    else
+      # 回退到 /etc/kernel/cmdline：这是纯文本单行格式，不是 limine 的 KERNEL_CMDLINE[] 语法
+      CMDLINE_FILE="${R}/etc/kernel/cmdline"
+      CMDLINE_KIND=plain
+    fi
+    return 0
+  fi
+  # BLS 条目优先于 GRUB：Fedora/RHEL 上 grub.cfg 只是链到 BLS 条目，
+  # 改 /etc/default/grub 对已装内核无效。
+  if [ "$BLS_MODE" != off ] && bls_has_entries; then
+    BACKEND=bls; CMDLINE_KIND=plain; CMDLINE_FILE="${R}/etc/kernel/cmdline"
+    return 0
+  fi
+  if [ -f "${R}/etc/default/grub" ]; then
+    BACKEND=grub; CMDLINE_KIND=grub; CMDLINE_FILE="${R}/etc/default/grub"
+    return 0
+  fi
+  BACKEND=kernel; CMDLINE_KIND=plain; CMDLINE_FILE="${R}/etc/kernel/cmdline"
+}
+
+# ---------- cmdline 读 / 写 --------------------------------------------------
+
+cmdline_read_from() { # $1=file $2=kind
+  local f="$1" kind="$2"
+  [ -f "$f" ] || return 0
+  case "$kind" in
+    limine)
+      sed -nE 's/^[[:space:]]*KERNEL_CMDLINE\[default\][[:space:]]*\+?=[[:space:]]*//p' "$f" \
+        | tail -n1 | strip_wrapping_quotes
+      ;;
+    grub)
+      sed -nE 's/^[[:space:]]*GRUB_CMDLINE_LINUX_DEFAULT[[:space:]]*=[[:space:]]*"(.*)"[[:space:]]*$/\1/p' "$f" \
+        | tail -n1
+      ;;
+    *)
+      tr '\n' ' ' < "$f"
+      ;;
+  esac
+}
+
+# 输出「把 $f 改成承载 $v」之后应当具有的完整内容（纯 stdout，不落地）
+cmdline_write_to() { # $1=file $2=kind $3=value
+  local f="$1" kind="$2" v="$3"
+  case "$kind" in
+    limine)
+      if [ -f "$f" ] && grep -qE '^[[:space:]]*KERNEL_CMDLINE\[default\][[:space:]]*\+?=' "$f"; then
+        # 保留原有的 `=` / `+=` 写法，只换值，让 off -> on 往返尽量忠实于原文件
+        awk -v v="$v" '
+          !done && match($0, /^[[:space:]]*KERNEL_CMDLINE\[default\][[:space:]]*\+?=/) {
+            pre = substr($0, RSTART, RLENGTH)
+            op  = (pre ~ /\+=$/) ? "+=" : "="
+            print "KERNEL_CMDLINE[default]" op v
+            done = 1; next
+          }
+          { print }
+        ' "$f"
+      elif [ -f "$f" ]; then
+        cat "$f"
+        printf '\n### added by boot-splash %s\nKERNEL_CMDLINE[default]=%s\n' "$VERSION" "$v"
+      else
+        # 新建时必须用 `=`：`+=` 会被其它 drop-in 的 += 内容拼接，可能拼出没有 root= 的命令行
+        printf '### added by boot-splash %s\nKERNEL_CMDLINE[default]=%s\n' "$VERSION" "$v"
+      fi
+      ;;
+    grub)
+      if [ -f "$f" ] && grep -qE '^[[:space:]]*GRUB_CMDLINE_LINUX_DEFAULT=' "$f"; then
+        awk -v v="$v" '
+          /^[[:space:]]*GRUB_CMDLINE_LINUX_DEFAULT=/ && !done {
+            print "GRUB_CMDLINE_LINUX_DEFAULT=\"" v "\""; done=1; next
+          }
+          { print }
+        ' "$f"
+      elif [ -f "$f" ]; then
+        cat "$f"
+        printf 'GRUB_CMDLINE_LINUX_DEFAULT="%s"\n' "$v"
+      else
+        printf 'GRUB_CMDLINE_LINUX_DEFAULT="%s"\n' "$v"
+      fi
+      ;;
+    *)
+      printf '%s\n' "$v"
+      ;;
+  esac
+}
+
+# 当前「已配置」的 cmdline：BLS 条目 > 目标文件 > /etc/kernel/cmdline > /proc/cmdline
+current_configured_cmdline() {
+  local cur=""
+  cur="$(cmdline_read_from "$CMDLINE_FILE" "$CMDLINE_KIND" || true)"
+  cur="$(normalize "$cur")"
+  if [ "$BACKEND" = bls ]; then
+    local f
+    f="$(bls_entries | head -n1)"
+    if [ -n "$f" ]; then
+      local b
+      b="$(normalize "$(bls_read_options "$f")")"
+      [ -n "$b" ] && cur="$b"
+    fi
+  fi
+  if [ -z "$cur" ] && [ -s "${R}/etc/kernel/cmdline" ]; then
+    cur="$(normalize "$(cmdline_read_from "${R}/etc/kernel/cmdline" plain)")"
+  fi
+  if [ -z "$cur" ]; then
+    cur="$(normalize "$(cmdline_read_from "$(proc_cmdline_file)" plain)")"
+    # /proc/cmdline 里的引导器私有参数不该写进持久配置
+    cur="$(printf '%s' "$cur" | sed -E 's/(^| )BOOT_IMAGE=[^ ]*//g; s/(^| )initrd=[^ ]*//g')"
+    cur="$(normalize "$cur")"
+  fi
+  printf '%s' "$cur"
+}
+
+# 防止把「能启动的系统」改成「起不来的系统」
+#   $1=新命令行  $2=原命令行
+assert_root_token() {
+  local tgt="$1" src="${2:-}"
+  if printf '%s\n' "$tgt" | tr ' ' '\n' | grep -qE '^root='; then
+    return 0
+  fi
+  if [ "$FORCE" = yes ]; then
+    warn "$(t root.force)"
+    return 0
+  fi
+  if printf '%s\n' "$src" | tr ' ' '\n' | grep -qE '^root='; then
+    die "$(t root.lost)"
+  fi
+  if [ "$BACKEND" = grub ]; then
+    return 0   # grub-mkconfig 会自行拼接 root=，这里只管理 GRUB_CMDLINE_LINUX_DEFAULT
+  fi
+  die "$(t root.missing)"
+}
+
+# ---------- mkinitcpio HOOKS -------------------------------------------------
+
+MKINITCPIO_CONF="${R}/etc/mkinitcpio.conf"
+
+has_plymouth_hook() {
+  [ -f "$MKINITCPIO_CONF" ] || return 1
+  grep -E '^[[:space:]]*HOOKS=' "$MKINITCPIO_CONF" | grep -qw plymouth
+}
+
+# $1=add|remove  $2=输出文件
+# 用 awk 把 HOOKS 解析成 token 再重组，数组形式 HOOKS=(...) 与字符串形式 HOOKS="..." 都支持，
+# plymouth 位于首位/末位/中间都能正确处理。
+render_hooks() {
+  local action="$1" dst="$2"
+  awk -v action="$action" '
+    function emit(   i, s) {
+      s = ""
+      for (i = 1; i <= n; i++) s = s (i > 1 ? " " : "") item[i]
+      return s
+    }
+    /^[[:space:]]*HOOKS=/ {
+      if (!match($0, /^[[:space:]]*HOOKS=[[:space:]]*[("]?/)) { print; next }
+      prefix = substr($0, 1, RLENGTH)
+      tail   = substr($0, RLENGTH + 1)
+      closer = ""
+      if (prefix ~ /\($/)     closer = ")"
+      else if (prefix ~ /"$/) closer = "\""
+      sub(/[[:space:]]*[)"][[:space:]]*$/, "", tail)
+      n = split(tail, raw, /[[:space:]]+/)
+      m = 0
+      for (i = 1; i <= n; i++) {
+        if (raw[i] == "") continue
+        if (raw[i] == "plymouth" && action == "remove") continue
+        item[++m] = raw[i]
+      }
+      n = m
+      if (action == "add") {
+        found = 0
+        for (i = 1; i <= n; i++) if (item[i] == "plymouth") found = 1
+        if (!found) {
+          pos = 0
+          for (i = 1; i <= n; i++) if (item[i] == "filesystems") { pos = i; break }
+          if (pos > 0) {
+            for (i = n + 1; i > pos; i--) item[i] = item[i - 1]
+            item[pos] = "plymouth"
+            n++
+          } else {
+            item[++n] = "plymouth"
+          }
+        }
+      }
+      printf "%s%s%s\n", prefix, emit(), closer
+      next
+    }
+    { print }
+  ' "$MKINITCPIO_CONF" > "$dst"
+}
+
+# ---------- 变更暂存 ---------------------------------------------------------
+
+stage() { # $1=目标文件  $2=新内容临时文件
+  PEND_FILES+=("$1")
+  PEND_TMPS+=("$2")
+}
+
+stage_hooks() {
+  local want="$1" tmp
+  [ -f "$MKINITCPIO_CONF" ] || return 0
+  tmp="$(mktemp)"
+  if [ "$want" = remove ]; then
+    has_plymouth_hook || { rm -f "$tmp"; return 0; }
+    render_hooks remove "$tmp"
+  else
+    has_plymouth_hook && { rm -f "$tmp"; return 0; }
+    render_hooks add "$tmp"
+  fi
+  if diff -q "$MKINITCPIO_CONF" "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"; return 0
+  fi
+  stage "$MKINITCPIO_CONF" "$tmp"
+}
+
+stage_cmdline() {
+  local target="$1" tmp
+  tmp="$(mktemp)"
+  cmdline_write_to "$CMDLINE_FILE" "$CMDLINE_KIND" "$target" > "$tmp"
+  if [ -f "$CMDLINE_FILE" ] && diff -q "$CMDLINE_FILE" "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"; return 0
+  fi
+  stage "$CMDLINE_FILE" "$tmp"
+}
+
+# ---------- 计划展示 / 应用 --------------------------------------------------
+
+show_plan() {
+  local i
+  if [ "${#PEND_FILES[@]}" -eq 0 ]; then
+    return 1
+  fi
+  log "$(t plan.header "${#PEND_FILES[@]}")"
+  for i in "${!PEND_FILES[@]}"; do
+    printf '\n  %s\n' "${PEND_FILES[$i]}"
+    if [ -f "${PEND_FILES[$i]}" ]; then
+      diff -u "${PEND_FILES[$i]}" "${PEND_TMPS[$i]}" | tail -n +3 | sed -E "s/^/    ${C_DIM}/; s/$/${C_OFF}/" || true
+    else
+      sed -E "s/^/    ${C_DIM}+/; s/$/${C_OFF}/" "${PEND_TMPS[$i]}"
+    fi
+  done
+  printf '\n'
+  return 0
+}
+
+confirm() {
+  [ "$ASSUME_YES" = yes ] && return 0
+  if [ ! -t 0 ] && [ ! -e /dev/tty ]; then
+    die "$(t confirm.noninteractive)"
+  fi
+  local ans
+  printf '  %s%s%s [y/N] ' "$C_YEL" "$(t confirm.prompt)" "$C_OFF"
+  read -r ans < /dev/tty || ans=n
+  case "$ans" in [yY]*) return 0 ;; *) return 1 ;; esac
+}
+
+apply_plan() {
+  local i
+  TS="$(date -u +%Y%m%dT%H%M%SZ)"
+  for i in "${!PEND_FILES[@]}"; do
+    backup_file "${PEND_FILES[$i]}"
+    mkdir -p "$(dirname "${PEND_FILES[$i]}")"
+    if [ -f "${PEND_FILES[$i]}" ]; then
+      cat "${PEND_TMPS[$i]}" > "${PEND_FILES[$i]}"
+    else
+      install -m 0644 "${PEND_TMPS[$i]}" "${PEND_FILES[$i]}"
+    fi
+    ok "$(t apply.written "${PEND_FILES[$i]}")"
+    rm -f "${PEND_TMPS[$i]}"
+  done
+  PEND_FILES=(); PEND_TMPS=()
+  prune_backups
+}
+
+# ---------- 重新生成 ---------------------------------------------------------
+
+regen() {
+  if [ "$NO_REGEN" = yes ]; then
+    warn "$(t regen.skip)"
+    return 0
+  fi
+  if [ -n "$R" ]; then
+    dim "$(t regen.shadow)"
+    return 0
+  fi
+  require_root
+  log "$(t regen.initramfs)"
+  if [ -f /etc/mkinitcpio.conf ]; then
+    mkinitcpio -P
+  elif have dracut; then
+    dracut -f --regenerate-all
+  elif have update-initramfs; then
+    update-initramfs -u -k all
+  else
+    warn "$(t regen.no-generator)"
+  fi
+
+  log "$(t regen.bootloader)"
+  case "$BACKEND" in
+    limine)
+      if have limine-update; then limine-update
+      elif have limine-mkinitcpio; then limine-mkinitcpio
+      else warn "$(t regen.no-limine)"; fi
+      ;;
+    grub)
+      if have grub-mkconfig; then grub-mkconfig -o /boot/grub/grub.cfg
+      else warn "$(t regen.no-grub)"; fi
+      ;;
+    bls)
+      # 条目文件已经直接改好了，不需要重新生成引导器配置。
+      dim "$(t regen.bls)"
+      ;;
+    *)
+      have bootctl && bootctl update || true
+      ;;
+  esac
+}
+
+verify() {
+  [ -n "$R" ] && return 0
+  log "$(t verify.header)"
+  local rc=0
+  if have lsinitcpio && [ -f /boot/initramfs-linux.img ]; then
+    if lsinitcpio /boot/initramfs-linux.img 2>/dev/null | grep -qi plymouth; then
+      warn "$(t verify.plymouth-present)"
+      rc=1
+    else
+      ok "$(t verify.plymouth-absent)"
+    fi
+  fi
+  if [ "$BACKEND" = limine ] && [ -f /boot/limine.conf ]; then
+    if grep -qw 'loglevel=7' /boot/limine.conf 2>/dev/null; then
+      ok "$(t verify.limine-ok)"
+    else
+      warn "$(t verify.limine-missing)"
+      rc=1
+    fi
+  fi
+  if [ "$BACKEND" = bls ]; then
+    local bf
+    bf="$(bls_entries | head -n1)"
+    if [ -n "$bf" ] && ! grep -qE '^[[:space:]]*options[[:space:]].*loglevel=7' "$bf"; then
+      warn "$(t verify.bls-missing "$bf")"
+      rc=1
+    fi
+  fi
+  if [ "$CMDLINE_KIND" = limine ] && [ -f "${R}/etc/default/limine" ] \
+     && grep -qE 'ENABLE_ENROLL_LIMINE_CONFIG[[:space:]]*=[[:space:]]*yes' "${R}/etc/default/limine"; then
+    warn "$(t verify.enroll)"
+  fi
+  return $rc
+}
+
+# ---------- 动作 -------------------------------------------------------------
+
+action_off() {
+  load_state
+  resolve_backend
+  log "$(t act.backend "$BACKEND" "$CMDLINE_FILE")"
+
+  local cur before_removed
+  cur="$(current_configured_cmdline)"
+  [ -n "$cur" ] || die "$(t act.nocmdline)"
+
+  # 记录本次真正删掉的参数（粘性：不清空历史记录）。
+  # 精确 token 和前缀形式（splash=silent）都要记，on 时才能精确还原。
+  before_removed="$(normalize "$(tokens_present_in "$STRIP_PARAMS" "$cur") $(tokens_matching_prefixes "$cur" "$STRIP_PREFIXES")")"
+  if [ -n "$before_removed" ]; then
+    PARAMS_REMOVED="$(normalize "${PARAMS_REMOVED:-} $before_removed")"
+  fi
+
+  local target
+  target="$(filter_out "$cur" $STRIP_PARAMS)"
+  target="$(filter_out_prefixes "$target" "$STRIP_PREFIXES")"
+  target="$(ensure_tokens "$target" $CONSOLE_PARAMS)"
+  assert_root_token "$target" "$cur"
+
+  stage_cmdline "$target"
+  stage_bls_entries "$target"
+  stage_hooks remove
+  if has_plymouth_hook; then HOOK_REMOVED=yes; fi
+
+  PARAMS_ADDED="$CONSOLE_PARAMS"
+  MODE=console
+
+  if ! show_plan; then
+    ok "$(t act.already-console)"
+    save_state
+    return 0
+  fi
+  if [ "$DRY_RUN" = yes ]; then
+    warn "$(t act.dryrun)"
+    return 0
+  fi
+  confirm || { warn "$(t act.cancelled)"; return 1; }
+  apply_plan
+  save_state
+  regen
+  verify || true
+  ok "$(t act.done-console)"
+}
+
+action_on() {
+  load_state
+  resolve_backend
+  log "$(t act.backend "$BACKEND" "$CMDLINE_FILE")"
+
+  local cur target restore
+  cur="$(current_configured_cmdline)"
+  [ -n "$cur" ] || die "$(t act.nocmdline)"
+
+  # 先剥掉所有我们管理过的参数
+  target="$(filter_out "$cur" $CONSOLE_PARAMS)"
+  # 再把当初删掉的加回去；没有历史记录就退回默认
+  restore="${PARAMS_REMOVED:-}"
+  [ -n "$restore" ] || restore="$SPLASH_PARAMS"
+  target="$(ensure_tokens "$target" $restore)"
+  assert_root_token "$target" "$cur"
+
+  stage_cmdline "$target"
+  stage_bls_entries "$target"
+  stage_hooks add
+
+  MODE=splash
+
+  if ! show_plan; then
+    ok "$(t act.already-splash)"
+    save_state
+    return 0
+  fi
+  if [ "$DRY_RUN" = yes ]; then
+    warn "$(t act.dryrun)"
+    return 0
+  fi
+  confirm || { warn "$(t act.cancelled)"; return 1; }
+  apply_plan
+  HOOK_REMOVED=no
+  PARAMS_REMOVED=""
+  PARAMS_ADDED=""
+  save_state
+  regen
+  ok "$(t act.done-splash)"
+  if ! have plymouth; then
+    warn "$(t act.no-plymouth1)"
+    warn "$(t act.no-plymouth2)"
+  fi
+}
+
+# 机器可读输出：标签固定为 ASCII，界面语言变化不影响解析
+action_status_porcelain() {
+  load_state
+  resolve_backend
+  local cur
+  cur="$(current_configured_cmdline)"
+  printf 'MODE=%s\n' "$MODE"
+  printf 'BACKEND=%s\n' "$BACKEND"
+  printf 'CMDLINE_FILE=%s\n' "$CMDLINE_FILE"
+  printf 'CMDLINE=%s\n' "$cur"
+  printf 'MANAGED_PARAMS=%s\n' "$CONSOLE_PARAMS"
+  printf 'PARAMS_REMOVED=%s\n' "${PARAMS_REMOVED:-}"
+  if [ -f "$MKINITCPIO_CONF" ]; then
+    if has_plymouth_hook; then printf 'HOOK_PLYMOUTH=yes\n'; else printf 'HOOK_PLYMOUTH=no\n'; fi
+  fi
+}
+
+action_status() {
+  if [ "$PORCELAIN" = yes ]; then
+    action_status_porcelain
+    return 0
+  fi
+  load_state
+  resolve_backend
+  local cur
+  cur="$(current_configured_cmdline)"
+
+  printf '\n  %s%s%s\n' "$C_BLU" "$(t st.title)" "$C_OFF"
+  kv "$(t st.mode)" "$MODE"
+  kv "$(t st.backend)" "$BACKEND"
+  kv "$(t st.cmdlinefile)" "$CMDLINE_FILE$([ -f "$CMDLINE_FILE" ] && echo '' || echo "  $(t st.missing)")"
+  kv "$(t st.cmdline)" "$cur"
+  kv "$(t st.managed)" "$CONSOLE_PARAMS"
+  kv "$(t st.restore)" "${PARAMS_REMOVED:-$(t st.none)}"
+
+  if [ -f "$MKINITCPIO_CONF" ]; then
+    if has_plymouth_hook; then
+      kv "$(t st.hook)" "${C_YEL}$(t st.hook.has)${C_OFF}"
+    else
+      kv "$(t st.hook)" "$(t st.hook.none)"
+    fi
+  fi
+
+  printf '\n  %s%s%s\n' "$C_BLU" "$(t st.runtime)" "$C_OFF"
+  if have plymouth; then
+    kv "$(t st.plymouth-installed)" "$(t st.yes)"
+  else
+    kv "$(t st.plymouth-installed)" "$(t st.no)"
+  fi
+  if have pgrep && pgrep -x plymouthd >/dev/null 2>&1; then
+    kv "$(t st.plymouth-running)" "${C_YEL}$(t st.yes)${C_OFF}"
+  else
+    kv "$(t st.plymouth-running)" "$(t st.no)"
+  fi
+  local vt
+  vt="$(cat /sys/class/vtconsole/*/name 2>/dev/null | tr '\n' ' ' || true)"
+  [ -n "${vt:-}" ] && kv "$(t st.vtconsole)" "$vt"
+  if [ -f /proc/cmdline ]; then
+    kv "$(t st.realcmdline)" "$(cat /proc/cmdline)"
+  fi
+
+  if [ -f "${R}/boot/limine.conf" ]; then
+    if grep -qE '^[[:space:]]*wallpaper:' "${R}/boot/limine.conf" 2>/dev/null; then
+      printf '\n  %s%s%s\n' "$C_BLU" "$(t st.menu)" "$C_OFF"
+      printf '    %s%s%s\n' "$C_YEL" "$(t st.wallpaper)" "$C_OFF"
+    fi
+  fi
+  printf '\n'
+}
+
+action_rollback() {
+  require_root
+  local latest
+  latest="$(ls -1 "$BACKUP_DIR" 2>/dev/null | sort -r | head -n1 || true)"
+  [ -n "$latest" ] || die "$(t rb.nobackup "$BACKUP_DIR")"
+  log "$(t rb.latest "$latest")"
+  find "${BACKUP_DIR}/${latest}" -type f ! -name NEW_FILES -printf '%P\n' | while read -r rel; do
+    ok "$(t rb.restore "$rel")"
+  done
+  [ "$DRY_RUN" = yes ] && { warn "$(t act.dryrun)"; return 0; }
+  if [ "$ASSUME_YES" = no ]; then
+    confirm || { warn "$(t act.cancelled)"; return 1; }
+  fi
+  find "${BACKUP_DIR}/${latest}" -type f ! -name NEW_FILES | while read -r src; do
+    rel="${src#"${BACKUP_DIR}/${latest}/"}"
+    mkdir -p "$(dirname "${R}/${rel}")"
+    cp -a "$src" "${R}/${rel}"
+  done
+  if [ -f "${BACKUP_DIR}/${latest}/NEW_FILES" ]; then
+    while read -r rel; do
+      [ -n "$rel" ] || continue
+      if [ -e "${R}/${rel}" ]; then
+        rm -f "${R}/${rel}"
+        ok "$(t rb.deleted "$rel")"
+      fi
+    done < "${BACKUP_DIR}/${latest}/NEW_FILES"
+  fi
+  ok "$(t rb.done)"
+}
+
+# ---------- 入口 -------------------------------------------------------------
+
+usage() {
+  if [ "$LANG_CODE" = zh ]; then
+    cat <<EOF
+$PROG $VERSION — 切换 Linux 开机动画 / 内核日志启动
+
+用法:
+  $PROG off [-y] [--dry-run] [--no-regen]   关闭开机动画，改为内核日志
+  $PROG on  [-y] [--dry-run] [--no-regen]   恢复图形开机动画
+  $PROG status [--porcelain]                查看状态
+  $PROG rollback [-y] [--dry-run]           回滚到最近一次备份
+
+选项:
+  -y, --yes         跳过确认
+  -n, --dry-run     只打印将要做的修改，不落盘
+      --no-regen    不执行 initramfs / 引导器刷新
+      --force       允许写入不含 root= 的命令行（危险）
+      --porcelain   status 输出机器可读的 ASCII key=value（语言无关）
+      --params "..."      覆盖"关闭动画"追加的参数
+                          默认: $DEFAULT_CONSOLE_PARAMS
+      --splash "..."      覆盖"开启动画"恢复的参数
+                          默认: $DEFAULT_SPLASH_PARAMS
+      --strip-extra "..." 只剥离、不作为默认恢复值的额外标志
+                          默认: $DEFAULT_STRIP_EXTRA（Fedora/RHEL 的 rhgb）
+      --strip-prefix "..." 按前缀剥离的标志
+                          默认: $DEFAULT_STRIP_PREFIXES（openSUSE 的 splash=silent）
+      --no-bls      不直接修改 /boot/loader/entries/*.conf（BLS 条目）
+  -h, --help        帮助
+  -V, --version     版本
+
+环境变量:
+  BOOT_SPLASH_LANG  输出语言：zh | en（默认按系统 locale 自动判断）
+  BOOT_SPLASH_ROOT  影子根目录，把全部路径重定向到该目录
+EOF
+  else
+    cat <<EOF
+$PROG $VERSION — toggle between a Linux boot splash and kernel-log boot output
+
+Usage:
+  $PROG off [-y] [--dry-run] [--no-regen]   Turn the boot splash off, use kernel log
+  $PROG on  [-y] [--dry-run] [--no-regen]   Restore the graphical boot splash
+  $PROG status [--porcelain]                Show state
+  $PROG rollback [-y] [--dry-run]           Roll back to the most recent backup
+
+Options:
+  -y, --yes         Skip confirmation
+  -n, --dry-run     Only print the changes; write nothing
+      --no-regen    Do not run the initramfs / bootloader refresh
+      --force       Allow writing a command line without root= (dangerous)
+      --porcelain   Make status emit machine-readable ASCII key=value lines
+      --params "..."      Override the parameters appended when turning the splash off
+                          default: $DEFAULT_CONSOLE_PARAMS
+      --splash "..."      Override the parameters restored when turning the splash on
+                          default: $DEFAULT_SPLASH_PARAMS
+      --strip-extra "..." Extra flags to strip but not restore by default
+                          default: $DEFAULT_STRIP_EXTRA (rhgb on Fedora/RHEL)
+      --strip-prefix "..." Flags stripped by prefix
+                          default: $DEFAULT_STRIP_PREFIXES (splash=silent on openSUSE)
+      --no-bls      Do not modify /boot/loader/entries/*.conf (BLS entries)
+  -h, --help        Show this help
+  -V, --version     Show version
+
+Environment:
+  BOOT_SPLASH_LANG  Output language: zh | en (defaults to the system locale)
+  BOOT_SPLASH_ROOT  Shadow root: redirect every path under this directory
+EOF
+  fi
+}
+
+main() {
+  local action=""
+  # 支持 boot-splash-off / boot-splash-on 这类符号链接别名
+  case "$PROG" in
+    *-splash-off) set -- off "$@" ;;
+    *-splash-on)  set -- on  "$@" ;;
+  esac
+  [ $# -eq 0 ] && { usage; exit 1; }
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      off|disable|console) action=off ;;
+      on|enable|splash)    action=on ;;
+      status|show)         action=status ;;
+      rollback|revert)     action=rollback ;;
+      -y|--yes)            ASSUME_YES=yes ;;
+      -n|--dry-run)        DRY_RUN=yes ;;
+      --no-regen)          NO_REGEN=yes ;;
+      --force)             FORCE=yes ;;
+      --porcelain)         PORCELAIN=yes ;;
+      --params)            shift; CONSOLE_PARAMS="${1:?--params 需要一个值}" ;;
+      --params=*)          CONSOLE_PARAMS="${1#*=}" ;;
+      --splash)            shift; SPLASH_PARAMS="${1:?--splash 需要一个值}" ;;
+      --splash=*)          SPLASH_PARAMS="${1#*=}" ;;
+      --strip-extra)       shift; DEFAULT_STRIP_EXTRA="${1:?--strip-extra 需要一个值}" ;;
+      --strip-extra=*)     DEFAULT_STRIP_EXTRA="${1#*=}" ;;
+      --strip-prefix)      shift; DEFAULT_STRIP_PREFIXES="${1:?--strip-prefix 需要一个值}" ;;
+      --strip-prefix=*)    DEFAULT_STRIP_PREFIXES="${1#*=}" ;;
+      --no-bls)            BLS_MODE=off ;;
+      -h|--help)           usage; exit 0 ;;
+      -V|--version)        printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+      *)                   err "$(t err.unknownarg "$1")"; usage >&2; exit 1 ;;
+    esac
+    shift
+  done
+
+  # 可选配置文件
+  if [ -f "${R}/etc/boot-splash.conf" ]; then
+    # shellcheck disable=SC1090
+    . "${R}/etc/boot-splash.conf"
+  fi
+
+  # 剥离集合 = 恢复默认值 + 发行版专属标志（Fedora/RHEL 的 rhgb 等）
+  STRIP_PARAMS="$(normalize "$SPLASH_PARAMS $DEFAULT_STRIP_EXTRA")"
+  STRIP_PREFIXES="$(normalize "$DEFAULT_STRIP_PREFIXES")"
+
+  # 串行化，避免两个实例互相踩。只读操作（status / --dry-run）拿不到锁也无所谓。
+  if have flock && mkdir -p "$STATE_DIR" 2>/dev/null && [ -w "$STATE_DIR" ]; then
+    exec 9>"${STATE_DIR}/lock"
+    flock -n 9 || die "$(t err.locked)"
+  fi
+
+  case "$action" in
+    off)      require_root; action_off ;;
+    on)       require_root; action_on ;;
+    status)   action_status ;;
+    rollback) action_rollback ;;
+    *)        usage; exit 1 ;;
+  esac
+}
+
+main "$@"
