@@ -76,7 +76,7 @@ Both forms of `HOOKS` are supported (`HOOKS=(...)` array form and `HOOKS="..."` 
 **Interactive TUI (recommended)**
 
 ```bash
-./install.sh          # No sudo needed; it asks for a password in the UI when privileges are required
+bash ./install.sh          # No sudo needed; it asks for a password in the UI when privileges are required
 ```
 
 It picks a language at startup (your last choice is remembered — press Enter to use the default):
@@ -125,9 +125,9 @@ Both option 1 and option 2 show the complete diff first, ask for confirmation, a
 **Command line**
 
 ```bash
-./install.sh --install           # Install the files only
-./install.sh --status            # Print status (no root needed)
-./install.sh --uninstall         # Remove the files (leaves the system config alone)
+bash ./install.sh --install           # Install the files only
+bash ./install.sh --status            # Print status (no root needed)
+bash ./install.sh --uninstall         # Remove the files (leaves the system config alone)
 
 boot-splash status               # Show the current state
 boot-splash off --dry-run        # Preview (no root needed)
