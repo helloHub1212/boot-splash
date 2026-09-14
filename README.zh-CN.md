@@ -76,7 +76,7 @@
 **TUI 交互界面（推荐）**
 
 ```bash
-./install.sh          # 不需要 sudo，需要权限时会在界面里问密码
+bash ./install.sh          # 不需要 sudo，需要权限时会在界面里问密码
 ```
 
 启动时先选语言（会记住上次的选择，直接回车即用默认值）：
@@ -125,9 +125,9 @@
 **命令行**
 
 ```bash
-./install.sh --install           # 只装文件
-./install.sh --status            # 打印状态（不需要 root）
-./install.sh --uninstall         # 卸载文件（不动系统配置）
+bash ./install.sh --install           # 只装文件
+bash ./install.sh --status            # 打印状态（不需要 root）
+bash ./install.sh --uninstall         # 卸载文件（不动系统配置）
 
 boot-splash status               # 看当前状态
 boot-splash off --dry-run        # 预览（不需要 root）
