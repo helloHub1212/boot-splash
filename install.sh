@@ -867,10 +867,16 @@ main() {
   case "$mode" in
     tui) main_loop ;;
     install)
-      ensure_root "$(t need.reason.install "$INSTALL_PATH")" || exit 1
+      # DESTDIR is a local staging tree and does not require privilege.
+      if [ -z "$DESTDIR" ]; then
+        ensure_root "$(t need.reason.install "$INSTALL_PATH")" || exit 1
+      fi
       do_install_files && log "$(t act.installed "$INSTALL_PATH")" || exit 1 ;;
     uninstall)
-      ensure_root "$(t need.reason.uninstall "$INSTALL_PATH")" || exit 1
+      # DESTDIR is a local staging tree and does not require privilege.
+      if [ -z "$DESTDIR" ]; then
+        ensure_root "$(t need.reason.uninstall "$INSTALL_PATH")" || exit 1
+      fi
       do_uninstall_files && log "$(t act.uninstalled)" ;;
     status)
       BOOT_SPLASH_LANG="$LANG_CODE" "$SUT" status ;;
