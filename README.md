@@ -76,7 +76,10 @@ Both forms of `HOOKS` are supported (`HOOKS=(...)` array form and `HOOKS="..."` 
 **Interactive TUI (recommended)**
 
 ```bash
-bash ./install.sh          # No sudo needed; it asks for a password in the UI when privileges are required
+git clone https://github.com/helloHub1212/boot-splash.git
+cd boot-splash
+chmod +x install.sh boot-splash
+./install.sh
 ```
 
 It picks a language at startup (your last choice is remembered — press Enter to use the default):
