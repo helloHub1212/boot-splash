@@ -76,7 +76,10 @@
 **TUI 交互界面（推荐）**
 
 ```bash
-bash ./install.sh          # 不需要 sudo，需要权限时会在界面里问密码
+git clone https://github.com/helloHub1212/boot-splash.git
+cd boot-splash
+chmod +x install.sh boot-splash
+./install.sh
 ```
 
 启动时先选语言（会记住上次的选择，直接回车即用默认值）：
